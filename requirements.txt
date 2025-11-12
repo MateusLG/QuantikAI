@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+google-cloud-aiplatform
+google-cloud-storage
+pypdf
+faiss-cpu
+langchain
+langchain-google-vertexai
