@@ -1,0 +1,14 @@
+Dockerfile
+.dockerignore
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+venv_new/
+.DS_Store
+faiss_index.bin
+doc_store.pkl
