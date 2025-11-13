@@ -18,9 +18,14 @@ load_dotenv()
 PROJECT_ID = os.getenv("PROJECT_ID")
 REGION = os.getenv("REGION", "us-central1")
 CORPUS_DISPLAY_NAME = os.getenv("CORPUS_DISPLAY_NAME", "Financial Documents RAG Corpus")
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 if not PROJECT_ID:
     raise ValueError("PROJECT_ID must be set in .env file")
+
+# Set credentials if provided in .env
+if GOOGLE_APPLICATION_CREDENTIALS:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
 
 # Initialize Vertex AI
 aiplatform.init(project=PROJECT_ID, location=REGION)

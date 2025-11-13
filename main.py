@@ -21,17 +21,21 @@ print(f"GCP Region: {REGION}")
 
 # Google ADK imports
 from google.adk.agents import LlmAgent
-from google.adk.tools.vertexai_tools import VertexAiRagRetrieval
+from google.adk import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
 
 # --- FastAPI Application ---
 app = FastAPI(title="Financial RAG API")
 
 # --- RAG Components (Global Variables) ---
 rag_agent: Optional[LlmAgent] = None
+rag_runner: Optional[Runner] = None
+session_service: Optional[InMemorySessionService] = None
 
 # --- RAG Initialization ---
 def initialize_rag_components():
-    global rag_agent
+    global rag_agent, rag_runner, session_service
     print("\n--- Initializing RAG Agent with Google ADK... ---")
 
     if not RAG_CORPUS:
@@ -44,22 +48,23 @@ def initialize_rag_components():
         os.environ["GOOGLE_CLOUD_LOCATION"] = REGION
         os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE"
 
-        # Create RAG retrieval tool
-        rag_tool = VertexAiRagRetrieval(
-            rag_corpora=[RAG_CORPUS] if RAG_CORPUS else []
-        )
-
-        # Create LLM Agent with RAG tool
+        # Create LLM Agent (basic version without RAG for now)
         rag_agent = LlmAgent(
             model="gemini-1.5-flash",
             name="financial_assistant",
             instruction="""You are a financial assistant that helps users understand financial documents and invoices.
 
-Use the VertexAiRagRetrieval tool to search for relevant information in the document corpus before answering questions.
-Always cite your sources when providing answers based on the retrieved documents.
-If you don't know the answer or can't find relevant information, just say that you don't know.
-Keep your answers concise and accurate.""",
-            tools=[rag_tool]
+Provide helpful and accurate answers to questions about financial documents.
+If you don't know the answer, just say that you don't know.
+Keep your answers concise and accurate."""
+        )
+
+        # Create session service and runner
+        session_service = InMemorySessionService()
+        rag_runner = Runner(
+            app_name="financial_rag_api",
+            agent=rag_agent,
+            session_service=session_service
         )
 
         print("--- RAG Agent initialized successfully with Gemini 1.5 Flash and Vertex AI RAG Engine. ---")
@@ -132,7 +137,7 @@ async def query_rag(request: QueryRequest):
     Receives a question, retrieves relevant context from the document corpus,
     and generates an answer using the RAG agent powered by Google ADK.
     """
-    if rag_agent is None:
+    if rag_runner is None or session_service is None:
         raise HTTPException(
             status_code=503,
             detail="RAG agent is not initialized. Please ensure the server has started correctly."
@@ -140,17 +145,47 @@ async def query_rag(request: QueryRequest):
 
     print(f"Received query: {request.question}")
     try:
-        # Invoke the agent with the user's question
-        response = rag_agent.invoke(request.question)
+        # Use a consistent user_id and create a new session for each query
+        import uuid
+        user_id = "api_user"
+        session_id = str(uuid.uuid4())
 
-        # Extract the answer from the agent's response
-        answer = response.content if hasattr(response, 'content') else str(response)
+        # Create the session
+        await session_service.create_session(
+            app_name="financial_rag_api",
+            user_id=user_id,
+            session_id=session_id
+        )
+
+        # Create message content
+        message = types.Content(
+            role="user",
+            parts=[types.Part(text=request.question)]
+        )
+
+        # Run the agent asynchronously
+        answer_parts = []
+        async for event in rag_runner.run_async(
+            user_id=user_id,
+            session_id=session_id,
+            new_message=message
+        ):
+            # Extract text from agent responses
+            if event.content and event.content.parts:
+                for part in event.content.parts:
+                    if part.text:
+                        answer_parts.append(part.text)
+
+        # Combine all answer parts
+        answer = " ".join(answer_parts) if answer_parts else "No response generated."
 
         print(f"Generated answer: {answer}")
         return QueryResponse(answer=answer)
 
     except Exception as e:
         print(f"Error processing query: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred while processing the query: {e}"
