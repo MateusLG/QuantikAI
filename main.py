@@ -1,138 +1,112 @@
 import os
-import pickle
 import uvicorn
 import sys
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 # --- Environment and Configuration ---
 from dotenv import load_dotenv
 load_dotenv()
 
 PROJECT_ID = os.getenv("PROJECT_ID")
-REGION = os.getenv("REGION")
+REGION = os.getenv("REGION", "us-central1")
+RAG_CORPUS = os.getenv("RAG_CORPUS")
 
-if not PROJECT_ID or not REGION:
-    raise ValueError("PROJECT_ID and REGION environment variables must be set in a .env file.")
+if not PROJECT_ID:
+    raise ValueError("PROJECT_ID environment variable must be set in a .env file.")
 
 print(f"GCP Project ID: {PROJECT_ID}")
 print(f"GCP Region: {REGION}")
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_google_vertexai import VertexAIEmbeddings
-from langchain_google_vertexai import ChatVertexAI
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_core.prompts import ChatPromptTemplate
-
+# Google ADK imports
+from google.adk.agents import LlmAgent
+from google.adk.tools.vertexai_tools import VertexAiRagRetrieval
 
 # --- FastAPI Application ---
 app = FastAPI(title="Financial RAG API")
 
 # --- RAG Components (Global Variables) ---
-vectorstore = None
-rag_chain = None
+rag_agent: Optional[LlmAgent] = None
 
 # --- RAG Initialization ---
 def initialize_rag_components():
-    global vectorstore, rag_chain
-    print("\n--- Initializing RAG components... ---")
+    global rag_agent
+    print("\n--- Initializing RAG Agent with Google ADK... ---")
 
-    # 1. Initialize Embeddings Model
+    if not RAG_CORPUS:
+        print("Warning: RAG_CORPUS not set. Please run the corpus preparation script first.")
+        print("The agent will still be created but retrieval may not work until corpus is configured.")
+
     try:
-        embeddings = VertexAIEmbeddings(model_name="textembedding-gecko@001", project=PROJECT_ID, location=REGION)
-        print("Vertex AI Embeddings initialized successfully.")
-    except Exception as e:
-        print(f"Error initializing Vertex AI Embeddings: {e}")
-        return
+        # Set up environment variables for ADK authentication
+        os.environ["GOOGLE_CLOUD_PROJECT"] = PROJECT_ID
+        os.environ["GOOGLE_CLOUD_LOCATION"] = REGION
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "TRUE"
 
-    # 2. Load FAISS Vector Store
-    if vectorstore is None:
-        try:
-            vectorstore = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-            with open("doc_store.pkl", "rb") as f:
-                vectorstore.docstore = pickle.load(f)
-            print("FAISS index and document store loaded successfully.")
-        except Exception as e:
-            print(f"Could not load FAISS index. Please run indexing first: `python main.py index`. Error: {e}")
-            vectorstore = None
-            return
-
-    # 3. Initialize LLM
-    try:
-        llm = ChatVertexAI(model_name="gemini-1.0-pro", project=PROJECT_ID, location=REGION)
-        print("Vertex AI LLM initialized successfully.")
-    except Exception as e:
-        print(f"Error initializing Vertex AI LLM: {e}")
-        return
-
-    # 4. Create RAG Chain
-    if vectorstore and llm and rag_chain is None:
-        print("Creating RAG chain...")
-        system_prompt = """
-        You are a financial assistant. Use the following pieces of context to answer the question at the end.
-        If you don't know the answer, just say that you don't know, don't try to make up an answer.
-        Keep the answer as concise as possible.
-
-        {context}
-        """
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_prompt),
-                ("human", "{input}"),
-            ]
+        # Create RAG retrieval tool
+        rag_tool = VertexAiRagRetrieval(
+            rag_corpora=[RAG_CORPUS] if RAG_CORPUS else []
         )
-        
-        question_answer_chain = create_stuff_documents_chain(llm, prompt)
-        rag_chain = create_retrieval_chain(vectorstore.as_retriever(), question_answer_chain)
-        print("--- RAG components initialized successfully. ---")
 
-# --- Indexing Function ---
-def index_documents():
-    print("\n--- Starting document indexing... ---")
-    data_path = "data/"
-    
-    # 1. Load Documents
-    documents = []
-    for file_name in os.listdir(data_path):
-        if file_name.endswith(".pdf"):
-            file_path = os.path.join(data_path, file_name)
-            print(f"Loading document: {file_path}")
-            try:
-                loader = PyPDFLoader(file_path)
-                documents.extend(loader.load())
-            except Exception as e:
-                print(f"Error loading {file_path}: {e}")
-    
-    if not documents:
-        print("No PDF documents found in 'data/' directory. Exiting indexing.")
-        return
+        # Create LLM Agent with RAG tool
+        rag_agent = LlmAgent(
+            model="gemini-1.5-flash",
+            name="financial_assistant",
+            instruction="""You are a financial assistant that helps users understand financial documents and invoices.
 
-    # 2. Split Documents
-    print(f"Loaded {len(documents)} document pages. Splitting into text chunks...")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    texts = text_splitter.split_documents(documents)
-    print(f"Split documents into {len(texts)} text chunks.")
+Use the VertexAiRagRetrieval tool to search for relevant information in the document corpus before answering questions.
+Always cite your sources when providing answers based on the retrieved documents.
+If you don't know the answer or can't find relevant information, just say that you don't know.
+Keep your answers concise and accurate.""",
+            tools=[rag_tool]
+        )
 
-    # 3. Generate Embeddings and Create FAISS Index
-    print("Initializing embeddings model for indexing...")
-    try:
-        embeddings = VertexAIEmbeddings(model_name="textembedding-gecko@001", project=PROJECT_ID, location=REGION)
-        print("Generating embeddings and building FAISS index...")
-        global vectorstore
-        vectorstore = FAISS.from_documents(texts, embeddings)
-        
-        # 4. Save FAISS Index
-        print("Saving FAISS index and document store...")
-        vectorstore.save_local("faiss_index")
-        with open("doc_store.pkl", "wb") as f:
-            pickle.dump(vectorstore.docstore, f)
-        print("--- Indexing complete. FAISS index saved to 'faiss_index'. ---")
+        print("--- RAG Agent initialized successfully with Gemini 1.5 Flash and Vertex AI RAG Engine. ---")
+
     except Exception as e:
-        print(f"An error occurred during embedding and indexing: {e}")
+        print(f"Error initializing RAG Agent: {e}")
+        raise
+
+# --- Corpus Setup Function ---
+def setup_corpus():
+    """
+    This function provides instructions for setting up Vertex AI RAG corpus.
+    For actual corpus creation and document upload, use the prepare_corpus.py script.
+    """
+    print("\n" + "="*80)
+    print("VERTEX AI RAG CORPUS SETUP")
+    print("="*80)
+    print("\nTo use this RAG application, you need to:")
+    print("\n1. Create a RAG corpus in Vertex AI")
+    print("2. Upload your PDF documents to the corpus")
+    print("3. Add the corpus ID to your .env file")
+    print("\nUse the prepare_corpus.py script to automate this process:")
+    print("\n  python prepare_corpus.py")
+    print("\nOr manually via Google Cloud Console:")
+    print(f"\n  - Navigate to: https://console.cloud.google.com/gen-app-builder/engines")
+    print(f"  - Project: {PROJECT_ID}")
+    print(f"  - Region: {REGION}")
+    print("  - Create a new RAG API corpus")
+    print("  - Upload PDFs from the 'data/' directory")
+    print("  - Copy the corpus resource name to .env as RAG_CORPUS")
+    print("\nCorpus resource name format:")
+    print("  projects/<project-number>/locations/<region>/ragCorpora/<corpus-id>")
+    print("\n" + "="*80)
+
+    # Check for PDFs in data directory
+    data_path = "data/"
+    if os.path.exists(data_path):
+        pdf_files = [f for f in os.listdir(data_path) if f.endswith(".pdf")]
+        if pdf_files:
+            print(f"\nFound {len(pdf_files)} PDF file(s) in '{data_path}':")
+            for pdf in pdf_files:
+                print(f"  - {pdf}")
+        else:
+            print(f"\nWarning: No PDF files found in '{data_path}'")
+    else:
+        print(f"\nWarning: '{data_path}' directory not found")
+    print()
 
 # --- FastAPI Models ---
 class QueryRequest(BaseModel):
@@ -155,28 +129,40 @@ async def health_check():
 @app.post("/query", response_model=QueryResponse, summary="Query the RAG System")
 async def query_rag(request: QueryRequest):
     """
-    Receives a question, retrieves relevant context from the document store,
-    and generates an answer using a large language model.
+    Receives a question, retrieves relevant context from the document corpus,
+    and generates an answer using the RAG agent powered by Google ADK.
     """
-    if rag_chain is None:
-        raise HTTPException(status_code=503, detail="RAG chain is not initialized. Please ensure indexing is complete and the server has started correctly.")
-    
+    if rag_agent is None:
+        raise HTTPException(
+            status_code=503,
+            detail="RAG agent is not initialized. Please ensure the server has started correctly."
+        )
+
     print(f"Received query: {request.question}")
     try:
-        result = rag_chain.invoke({"input": request.question})
-        print(f"Generated answer: {result['answer']}")
-        return QueryResponse(answer=result["answer"])
+        # Invoke the agent with the user's question
+        response = rag_agent.invoke(request.question)
+
+        # Extract the answer from the agent's response
+        answer = response.content if hasattr(response, 'content') else str(response)
+
+        print(f"Generated answer: {answer}")
+        return QueryResponse(answer=answer)
+
     except Exception as e:
         print(f"Error processing query: {e}")
-        raise HTTPException(status_code=500, detail=f"An error occurred while processing the query: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while processing the query: {e}"
+        )
 
 # --- Command Line Interface ---
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "index":
-        os.environ["INDEXING_MODE"] = "true"
-        index_documents()
+    if len(sys.argv) > 1 and sys.argv[1] == "setup":
+        setup_corpus()
     else:
         print("Starting FastAPI server...")
+        print("Use 'python main.py setup' to see corpus setup instructions")
         uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
